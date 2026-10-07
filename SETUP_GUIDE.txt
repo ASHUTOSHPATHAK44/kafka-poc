@@ -1,0 +1,257 @@
+===============================================================================
+ CDC LAKEHOUSE POC - STEP BY STEP SETUP GUIDE
+ Postgres -> Debezium -> Kafka -> Spark -> Iceberg (MinIO), orchestrated by Airflow
+===============================================================================
+
+Everything runs inside Docker. You do NOT need Python, Java, Spark, or Kafka
+installed on your machine. You only need Docker.
+
+For deeper explanations of every component and concept, see DOCUMENTATION.md.
+This file is just the "what do I run" checklist.
+
+
+-------------------------------------------------------------------------------
+ 0. PREREQUISITES
+-------------------------------------------------------------------------------
+
+- Docker Desktop installed and RUNNING (Linux containers mode).
+- ~8 GB RAM available to Docker, a few GB of free disk.
+- These commands are written for Windows PowerShell (run from the project root,
+  e.g. C:\kafka-poc). On Mac/Linux, replace the backtick (`) line-continuations
+  with backslash (\) and curl.exe with curl.
+- Open a terminal in the project root (the folder containing docker-compose.yml).
+
+
+-------------------------------------------------------------------------------
+ 1. START THE WHOLE STACK (first time: builds images, pulls ~2 GB)
+-------------------------------------------------------------------------------
+
+    docker compose up -d --build
+
+Wait ~1-3 minutes on first run. Then check status:
+
+    docker compose ps
+
+What you want to see:
+  - postgres, kafka, minio, iceberg-rest, spark-master, spark-worker,
+    spark-history, spark-client, kafka-ui, airflow-db, airflow = running/healthy
+  - minio-init = Exited (0)   <-- this is CORRECT (it's a one-shot bucket setup)
+
+If iceberg-rest shows "Restarting", wait a bit; it depends on postgres+minio
+being healthy first. Re-check with: docker compose ps iceberg-rest
+
+
+-------------------------------------------------------------------------------
+ 2. REGISTER THE DEBEZIUM CONNECTOR (starts Postgres -> Kafka capture)
+-------------------------------------------------------------------------------
+
+    curl.exe -s -X POST -H "Content-Type: application/json" `
+      --data "@connectors/postgres-inventory.json" `
+      http://localhost:8083/connectors
+
+Verify it is RUNNING (connector + task):
+
+    curl.exe -s http://localhost:8083/connectors/inventory-connector/status
+
+Verify the CDC topics were created:
+
+    docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    (expect: poc.inventory.customers  and  poc.inventory.orders)
+
+At this point the seed rows from Postgres are already sitting in Kafka.
+
+
+===============================================================================
+ PIPELINE A - STREAMING  (kafka_to_iceberg_v2.py  ->  lakehouse.cdc_v2)
+===============================================================================
+
+Near-real-time. Reads the CDC topics as a continuous stream and MERGEs each
+change into Iceberg within seconds.
+
+-------------------------------------------------------------------------------
+ A1. START THE STREAMING JOB  (long-running; keep this terminal open)
+-------------------------------------------------------------------------------
+
+    docker compose exec spark-client /opt/spark/bin/spark-submit `
+      --master spark://spark-master:7077 --conf spark.cores.max=1 `
+      /opt/spark/jobs/kafka_to_iceberg_v2.py
+
+  - --conf spark.cores.max=1 caps it to 1 core so a second query can share the
+    2-core worker. Leave this running; it will not exit (it is streaming).
+  - You should see lines like:
+        >>> streaming poc.inventory.customers -> lakehouse.cdc_v2.customers ...
+        >>> batch 0: merged change(s) into lakehouse.cdc_v2.customers
+  - To stop it later: press Ctrl+C in this terminal.
+
+-------------------------------------------------------------------------------
+ A2. VERIFY  (open a SECOND terminal, in the project root)
+-------------------------------------------------------------------------------
+
+    docker compose exec spark-client /opt/spark/bin/spark-sql `
+      --master spark://spark-master:7077 --conf spark.cores.max=1 `
+      -e "SELECT * FROM lakehouse.cdc_v2.customers ORDER BY id"
+
+-------------------------------------------------------------------------------
+ A3. LIVE TEST  (watch a change flow through in seconds)
+-------------------------------------------------------------------------------
+
+    docker compose exec postgres psql -U postgres -d inventory -c `
+      "INSERT INTO inventory.customers (first_name,last_name,email) VALUES ('Jane','Doe','jane.doe@example.com');"
+
+  Watch the streaming terminal print a new merged line, then re-run A2 - the
+  new row appears. Try UPDATE and DELETE too (deletes need the FK respected:
+  delete the customer's orders first, or edit a customer with no orders).
+
+
+===============================================================================
+ PIPELINE B - BATCH  (batch_consumer.py  ->  lakehouse.cdc_batch, via Airflow)
+===============================================================================
+
+Bounded batches on a schedule. Reads NEW records since the last run (Kafka
+consumer-group offsets), MERGEs them, commits offsets only after success, exits.
+Orchestrated by Airflow every 5 minutes. Writes to a SEPARATE namespace
+(lakehouse.cdc_batch) so it never collides with the streaming job.
+
+You can run Pipeline B with or without Pipeline A running - they are independent.
+
+-------------------------------------------------------------------------------
+ B1. OPTION 1 - RUN THE BATCH JOB MANUALLY (no Airflow needed)
+-------------------------------------------------------------------------------
+
+    docker compose exec spark-client /opt/spark/bin/spark-submit `
+      --master spark://spark-master:7077 --conf spark.cores.max=1 `
+      /opt/spark/jobs/batch_consumer.py
+
+  It processes whatever is new since its last run, then EXITS. Expect:
+        >>> ===== lakehouse.cdc_batch.customers: writing N record(s) this run ...
+        >>> committed offsets for poc.inventory.customers: {...}
+        >>> batch run done | tables_processed=... failures=0
+  If there is nothing new it prints "no new records; skipping" (correct).
+
+-------------------------------------------------------------------------------
+ B2. OPTION 2 - LET AIRFLOW RUN IT EVERY 5 MINUTES
+-------------------------------------------------------------------------------
+
+  1. Open Airflow:   http://localhost:8085      (login: admin / admin)
+  2. Find the DAG:   cdc_batch_to_iceberg
+  3. Toggle it ON (unpause). It now runs every 5 minutes automatically.
+  4. Click a run -> task "run_batch_consumer" -> Logs to see the records written.
+  To stop scheduled runs: toggle the DAG OFF (pause).
+
+-------------------------------------------------------------------------------
+ B3. VERIFY THE BATCH TABLES
+-------------------------------------------------------------------------------
+
+    docker compose exec spark-client /opt/spark/bin/spark-sql `
+      --master spark://spark-master:7077 --conf spark.cores.max=1 `
+      -e "SELECT * FROM lakehouse.cdc_batch.customers ORDER BY id"
+
+    docker compose exec spark-client /opt/spark/bin/spark-sql `
+      --master spark://spark-master:7077 --conf spark.cores.max=1 `
+      -e "SELECT * FROM lakehouse.cdc_batch.orders ORDER BY id"
+
+-------------------------------------------------------------------------------
+ B4. CHECK BATCH OFFSETS (how far the batch consumer has read)
+-------------------------------------------------------------------------------
+
+    docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh `
+      --bootstrap-server kafka:9092 --describe --group cdc-batch-consumer-customers
+    (LAG = 0 means it has consumed everything currently in the topic)
+
+
+===============================================================================
+ OPTIONAL - AUTO-GENERATE DEMO DATA (1 random customer + order per minute)
+===============================================================================
+
+  1. Open Airflow:   http://localhost:8085   (admin / admin)
+  2. Find the DAG:   cdc_data_generator   (it starts PAUSED)
+  3. Toggle it ON  -> it inserts 1 random customer + 1 random order every minute.
+     Toggle it OFF -> insertion stops. Toggle ON again -> it resumes.
+  4. The task Logs show each inserted row.
+
+  With the generator ON, you can watch:
+    - the STREAMING table (cdc_v2) update within seconds, and
+    - the BATCH table (cdc_batch) update every 5 minutes.
+  That difference is the streaming-vs-batch latency, live.
+
+
+===============================================================================
+ THE UIs (all on localhost)
+===============================================================================
+
+  Kafka UI          http://localhost:8088    topics, messages, connectors
+  MinIO Console     http://localhost:9001     minioadmin / minioadmin  (bucket: warehouse)
+  Spark Master      http://localhost:8080     workers, running/waiting apps
+  Spark Worker      http://localhost:8081
+  Spark History     http://localhost:18080    finished apps
+  Spark Driver      http://localhost:4040     live job (while one is running)
+  Kafka Connect API http://localhost:8083
+  Iceberg REST      http://localhost:8181     /v1/config , /v1/namespaces
+  Airflow           http://localhost:8085     admin / admin
+
+
+===============================================================================
+ START / STOP / RESET
+===============================================================================
+
+  Pause everything (keeps data + images):   docker compose stop
+  Resume:                                    docker compose start
+  Remove containers (keeps data volumes):    docker compose down
+  Remove containers AND all data:            docker compose down -v
+      (after down -v you start fresh from Step 1, and must re-run Step 2)
+
+
+===============================================================================
+ QUICK TROUBLESHOOTING
+===============================================================================
+
+- iceberg-rest keeps restarting:
+    docker compose logs iceberg-rest --tail 40
+    (it must reach postgres iceberg_catalog DB + minio; both must be healthy)
+
+- A spark-sql query hangs on "Initial job has not accepted any resources":
+    the worker's 2 cores are taken by a running job. Both commands here use
+    --conf spark.cores.max=1 so they share; make sure you included that flag.
+
+- Batch table looks empty or only has recent rows:
+    Kafka default retention is 7 days - records older than that are gone from
+    the topic and cannot be replayed. Generate fresh data (the generator DAG)
+    or re-snapshot via Debezium. See DOCUMENTATION.md Section 15.
+
+- See logs for any service:
+    docker compose logs <service> --tail 50
+    (services: postgres kafka connect minio iceberg-rest spark-master
+     spark-worker spark-client kafka-ui airflow airflow-db)
+
+- Airflow task logs (batch + generator): http://localhost:8085 -> DAG -> run -> task -> Logs
+
+
+===============================================================================
+ ONE-SCREEN CHEAT SHEET
+===============================================================================
+
+  docker compose up -d --build                         # 1. start everything
+  curl.exe -s -X POST -H "Content-Type: application/json" `
+    --data "@connectors/postgres-inventory.json" `
+    http://localhost:8083/connectors                   # 2. register Debezium
+
+  # STREAMING (cdc_v2):
+  docker compose exec spark-client /opt/spark/bin/spark-submit `
+    --master spark://spark-master:7077 --conf spark.cores.max=1 `
+    /opt/spark/jobs/kafka_to_iceberg_v2.py
+
+  # BATCH (cdc_batch) - manual run:
+  docker compose exec spark-client /opt/spark/bin/spark-submit `
+    --master spark://spark-master:7077 --conf spark.cores.max=1 `
+    /opt/spark/jobs/batch_consumer.py
+  #   ...or enable the cdc_batch_to_iceberg DAG in Airflow (http://localhost:8085)
+
+  # VERIFY:
+  docker compose exec spark-client /opt/spark/bin/spark-sql `
+    --master spark://spark-master:7077 --conf spark.cores.max=1 `
+    -e "SELECT * FROM lakehouse.cdc_v2.customers ORDER BY id"
+  docker compose exec spark-client /opt/spark/bin/spark-sql `
+    --master spark://spark-master:7077 --conf spark.cores.max=1 `
+    -e "SELECT * FROM lakehouse.cdc_batch.customers ORDER BY id"
+
+===============================================================================

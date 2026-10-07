@@ -1,0 +1,414 @@
+# =============================================================================
+#  Local CDC lakehouse POC — everything runs inside Docker
+#
+#  Postgres --(Debezium/Kafka Connect)--> Kafka --(Spark Structured Streaming)-->
+#  Iceberg tables --> MinIO (S3)
+#
+#  UIs
+#    Kafka UI          http://localhost:8088
+#    MinIO console      http://localhost:9001   (minioadmin / minioadmin)
+#    Spark master UI    http://localhost:8080
+#    Spark worker UI    http://localhost:8081
+#    Spark history UI   http://localhost:18080
+#    Spark driver UI    http://localhost:4040   (while a job is running)
+#    Kafka Connect API  http://localhost:8083
+#    Iceberg REST API   http://localhost:8181
+#
+#  NOTE ON SECURITY: this stack is deliberately wide open — Kafka is PLAINTEXT
+#  with no ACLs, the Kafka Connect REST API, the Iceberg REST catalog and the
+#  Spark master have no authentication, and MinIO uses the well-known default
+#  credentials. Everything binds to 127.0.0.1 only. Do not expose these ports
+#  beyond your machine and do not reuse this configuration outside a local POC.
+# =============================================================================
+
+name: kafka-poc
+
+x-aws-env: &aws-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: ${AWS_REGION}
+  AWS_DEFAULT_REGION: ${AWS_REGION}
+
+services:
+
+  # ===========================================================================
+  # 1. Source database
+  # ===========================================================================
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: poc-postgres
+    restart: unless-stopped
+    # Logical decoding is what Debezium reads; it is off by default.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [poc]
+
+  # ===========================================================================
+  # 2. Kafka (single-node KRaft — no ZooKeeper)
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:${KAFKA_VERSION}
+    container_name: poc-kafka
+    restart: unless-stopped
+    ports:
+      # in-cluster clients use kafka:9092, host tools use localhost:29092
+      - "127.0.0.1:29092:29092"
+    environment:
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xmx1G -Xms512M
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    networks: [poc]
+
+  kafka-ui:
+    image: kafbat/kafka-ui:${KAFKA_UI_VERSION}
+    container_name: poc-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+      JAVA_OPTS: -Xmx512m
+    networks: [poc]
+
+  # ===========================================================================
+  # 3. Producer: Debezium on Kafka Connect
+  # ===========================================================================
+  connect:
+    image: quay.io/debezium/connect:${DEBEZIUM_VERSION}
+    container_name: poc-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: poc-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Plain JSON without embedded schemas keeps the Spark side simple.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xmx1G -Xms256M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    networks: [poc]
+
+  # ===========================================================================
+  # 4. Object store
+  # ===========================================================================
+  minio:
+    image: quay.io/minio/minio:${MINIO_VERSION}
+    container_name: poc-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${AWS_REGION}
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks: [poc]
+
+  # One-shot: create the Iceberg warehouse bucket, then exit.
+  minio-init:
+    image: quay.io/minio/mc:${MC_VERSION}
+    container_name: poc-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/${ICEBERG_WAREHOUSE_BUCKET}
+        mc ls local
+        echo "MinIO bootstrap complete."
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    restart: "no"
+    networks: [poc]
+
+  # ===========================================================================
+  # 5. Iceberg REST catalog (JDBC metadata in Postgres, data in MinIO)
+  # ===========================================================================
+  iceberg-rest:
+    build:
+      context: ./docker/iceberg-rest
+      args:
+        ICEBERG_VERSION: ${ICEBERG_VERSION}
+        POSTGRES_JDBC_VERSION: ${POSTGRES_JDBC_VERSION}
+    image: poc-iceberg-rest:${ICEBERG_VERSION}-pg
+    container_name: poc-iceberg-rest
+    restart: unless-stopped
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8181:8181"
+    environment:
+      <<: *aws-env
+      CATALOG_WAREHOUSE: s3://${ICEBERG_WAREHOUSE_BUCKET}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # JDBC catalog backed by a dedicated Postgres DB. Postgres serializes
+      # concurrent commits correctly (fixes the SQLITE_BUSY lock errors) and
+      # persists catalog metadata across restarts. The fixture image bundles
+      # the Postgres JDBC driver and creates its catalog tables on first use.
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://postgres:5432/${CATALOG_DB}
+      CATALOG_JDBC_USER: ${CATALOG_DB_USER}
+      CATALOG_JDBC_PASSWORD: ${CATALOG_DB_PASSWORD}
+    networks: [poc]
+
+  # ===========================================================================
+  # 6. Consumer: Spark 3.5.9 standalone cluster (Java 17 + Python in-image)
+  # ===========================================================================
+  spark-master:
+    build: &spark-build
+      context: ./docker/spark
+      args:
+        SPARK_VERSION: ${SPARK_VERSION}
+        SCALA_BINARY_VERSION: ${SCALA_BINARY_VERSION}
+        ICEBERG_VERSION: ${ICEBERG_VERSION}
+        KAFKA_CLIENTS_VERSION: ${KAFKA_CLIENTS_VERSION}
+        COMMONS_POOL2_VERSION: ${COMMONS_POOL2_VERSION}
+    image: poc-spark:${SPARK_VERSION}-iceberg${ICEBERG_VERSION}
+    container_name: poc-spark-master
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    environment: &spark-env
+      <<: *aws-env
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_DAEMON_MEMORY: 512m
+    ports:
+      - "127.0.0.1:8080:8080"   # master UI
+      - "127.0.0.1:7077:7077"   # cluster submit endpoint
+    volumes: &spark-volumes
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./jobs:/opt/spark/jobs:ro
+      - spark-events:/opt/spark/events
+      - spark-checkpoints:/opt/spark/checkpoints
+    networks: [poc]
+
+  spark-worker:
+    build: *spark-build
+    image: poc-spark:${SPARK_VERSION}-iceberg${ICEBERG_VERSION}
+    container_name: poc-spark-worker
+    restart: unless-stopped
+    depends_on: [spark-master]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - 2g
+    environment: *spark-env
+    ports:
+      - "127.0.0.1:8081:8081"   # worker UI
+    volumes: *spark-volumes
+    networks: [poc]
+
+  # Spark UI for completed applications.
+  spark-history:
+    build: *spark-build
+    image: poc-spark:${SPARK_VERSION}-iceberg${ICEBERG_VERSION}
+    container_name: poc-spark-history
+    restart: unless-stopped
+    depends_on: [spark-master]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.history.HistoryServer
+    environment:
+      <<: *aws-env
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_DAEMON_MEMORY: 512m
+      SPARK_HISTORY_OPTS: -Dspark.history.fs.logDirectory=file:/opt/spark/events -Dspark.history.ui.port=18080
+    ports:
+      - "127.0.0.1:18080:18080"
+    volumes: *spark-volumes
+    networks: [poc]
+
+  # Long-lived container to run spark-submit / spark-sql from inside Docker,
+  # so nothing (Python, Java, Spark) is ever needed on the host.
+  spark-client:
+    build: *spark-build
+    image: poc-spark:${SPARK_VERSION}-iceberg${ICEBERG_VERSION}
+    container_name: poc-spark-client
+    restart: unless-stopped
+    depends_on: [spark-master, iceberg-rest]
+    command: ["sleep", "infinity"]
+    environment: *spark-env
+    ports:
+      - "127.0.0.1:4040:4040"   # driver UI while a job runs here
+    volumes: *spark-volumes
+    networks: [poc]
+
+  # ===========================================================================
+  # 7. Airflow — orchestrates the BATCH consumer (batch_consumer.py) on a
+  #    schedule (every 5 min). It does NOT run Spark itself; the DAG triggers
+  #    `spark-submit` inside the existing poc-spark-client container via the
+  #    mounted Docker socket. Airflow keeps its own metadata in a separate
+  #    Postgres (airflow-db), isolated from the CDC/catalog Postgres.
+  #
+  #    Standalone mode runs the scheduler + webserver in one container and
+  #    auto-creates an admin user (admin / admin). Fine for a local POC.
+  # ===========================================================================
+  airflow-db:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: poc-airflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [poc]
+
+  airflow:
+    image: apache/airflow:${AIRFLOW_VERSION}
+    container_name: poc-airflow
+    restart: unless-stopped
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Standalone auto-creates this admin login for the web UI.
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      # The DAG shells out to the host docker CLI to exec into spark-client.
+      SPARK_CLIENT_CONTAINER: poc-spark-client
+      PIP_ADDITIONAL_REQUIREMENTS: ""
+    ports:
+      - "127.0.0.1:8085:8080"   # Airflow web UI
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      # SQL used by the data-generator DAG (docker exec'd into postgres).
+      - ./scripts:/opt/airflow/scripts:ro
+      # Docker CLI + socket so the DAG can `docker exec` into spark-client / postgres.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Install the docker CLI, init the DB, create the admin user, then run
+    # scheduler + webserver together (standalone) — all in one container.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        if ! command -v docker >/dev/null 2>&1; then
+          pip install --no-cache-dir apache-airflow-providers-docker >/dev/null 2>&1 || true
+        fi
+        airflow db migrate
+        airflow users create --username "$${_AIRFLOW_WWW_USER_USERNAME}" \
+          --password "$${_AIRFLOW_WWW_USER_PASSWORD}" --firstname admin \
+          --lastname admin --role Admin --email admin@example.com || true
+        airflow standalone
+    networks: [poc]
+
+networks:
+  poc:
+    name: kafka-poc-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+  kafka-data:
+  minio-data:
+  spark-events:
+  spark-checkpoints:
+  airflow-db-data:

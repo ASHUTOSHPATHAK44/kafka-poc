@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Config for the Airflow-orchestrated BATCH consumer (batch_consumer.py).",
+    "",
+    "Unlike the streaming engine (kafka_to_iceberg_v2.py), this job runs once per",
+    "trigger: it reads a bounded chunk of new Kafka records (from the consumer",
+    "group's last committed offset up to the current end), MERGEs them into",
+    "Iceberg, commits the new offsets to Kafka, then EXITS. Airflow re-triggers",
+    "it on a schedule (e.g. every 5 minutes).",
+    "",
+    "Offset management = Kafka consumer group (Option A): offsets are committed",
+    "ONLY after a successful write, so a mid-run failure causes the next run to",
+    "re-read the un-committed records (at-least-once; MERGE idempotency dedups).",
+    "",
+    "Per-table 'engine' selects the writer:",
+    "  spark  -> Spark batch read + MERGE INTO (implemented)",
+    "  polars -> reserved for a future Polars/PyIceberg writer (NOT yet implemented)",
+    "",
+    "Writes go to a SEPARATE namespace (lakehouse.cdc_batch) so this job never",
+    "collides with the streaming job's lakehouse.cdc_v2 tables."
+  ],
+
+  "defaults": {
+    "engine": "spark",
+    "namespace": "lakehouse.cdc_batch",
+    "consumer_group": "cdc-batch-consumer",
+    "max_records_per_run": 100000,
+    "poll_timeout_ms": 10000,
+    "starting_offsets_if_new": "earliest"
+  },
+
+  "tables": {
+    "customers": {
+      "topic": "poc.inventory.customers",
+      "key": "id",
+      "engine": "spark",
+      "columns": [
+        ["id",         "BIGINT"],
+        ["first_name", "STRING"],
+        ["last_name",  "STRING"],
+        ["email",      "STRING"],
+        ["updated_at", "STRING"]
+      ]
+    },
+
+    "orders": {
+      "topic": "poc.inventory.orders",
+      "key": "id",
+      "engine": "spark",
+      "columns": [
+        ["id",          "BIGINT"],
+        ["customer_id", "INT"],
+        ["product",     "STRING"],
+        ["quantity",    "INT"],
+        ["amount",      "DOUBLE"],
+        ["created_at",  "STRING"]
+      ]
+    }
+  }
+}

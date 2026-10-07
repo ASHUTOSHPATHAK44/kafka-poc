@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "Table catalog for the generic CDC -> Iceberg engine (kafka_to_iceberg_v2.py).",
+    "Adding a table = add an entry under 'tables' + restart the job. No code changes.",
+    "",
+    "Per table:",
+    "  topic    Kafka topic Debezium publishes to (prefix.schema.table)",
+    "  key      primary-key column used by MERGE ... ON",
+    "  columns  ordered [name, type] pairs, defined ONCE and used to build BOTH",
+    "           the parse schema AND the Iceberg DDL, so they cannot drift apart",
+    "           (that mismatch was the old updated_at = NULL bug).",
+    "",
+    "'type' = Spark SQL type. Map DEBEZIUM's JSON output, not Postgres:",
+    "  int/serial -> INT or BIGINT | text/varchar -> STRING |",
+    "  numeric/decimal -> DOUBLE (connector decimal.handling.mode=double) |",
+    "  timestamp/timestamptz -> STRING (Debezium emits an ISO-8601 string) |",
+    "  boolean -> BOOLEAN"
+  ],
+
+  "defaults": {
+    "starting_offsets": "earliest",
+    "max_offsets_per_trigger": null,
+    "processing_time": null
+  },
+
+  "tables": {
+    "customers": {
+      "topic": "poc.inventory.customers",
+      "key": "id",
+      "columns": [
+        ["id",         "BIGINT"],
+        ["first_name", "STRING"],
+        ["last_name",  "STRING"],
+        ["email",      "STRING"],
+        ["updated_at", "STRING"]
+      ]
+    },
+
+    "orders": {
+      "topic": "poc.inventory.orders",
+      "key": "id",
+      "columns": [
+        ["id",          "BIGINT"],
+        ["customer_id", "INT"],
+        ["product",     "STRING"],
+        ["quantity",    "INT"],
+        ["amount",      "DOUBLE"],
+        ["created_at",  "STRING"]
+      ]
+    }
+  }
+}
